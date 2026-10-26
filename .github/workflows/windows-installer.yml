@@ -1,0 +1,70 @@
+# Builds Lemon Studio for Windows and packages it into a Setup .exe installer.
+# Runs on every push to the windows-installer branch, or by hand from the Actions tab.
+name: Windows installer
+
+on:
+  push:
+    branches: [windows-installer]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Lemon Studio
+        run: cargo build --release --locked -p os-app --bin lemonstudio
+
+      - name: Build Lemon plugins (VST3 + CLAP)
+        run: cargo run --release --locked -p bundle-plugins
+
+      - name: Stage files for the installer
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Force "$stage/plugins" | Out-Null
+          Copy-Item target/release/lemonstudio.exe $stage/
+          Copy-Item crates/os-app/assets/lemonstudio.ico $stage/
+          Copy-Item LICENSE $stage/LICENSE.txt
+          Copy-Item THIRD-PARTY-NOTICES.txt $stage/
+          $bundled = if (Test-Path target/bundled) { "target/bundled" } else { "target/release/bundled" }
+          Get-ChildItem $bundled -Filter *.vst3 | Copy-Item -Destination "$stage/plugins" -Recurse
+          Get-ChildItem $bundled -Filter *.clap | Copy-Item -Destination "$stage/plugins" -Recurse
+          $vst3 = Get-ChildItem "$stage/plugins" -Filter *.vst3 | ForEach-Object Name
+          $clap = Get-ChildItem "$stage/plugins" -Filter *.clap | ForEach-Object Name
+          ($vst3 + $clap) | Set-Content "$stage/plugins.txt"
+          $lines = @()
+          foreach ($n in $vst3) { $lines += "RMDir /r `"`$COMMONFILES64\VST3\$n`"" }
+          foreach ($n in $clap) {
+            $lines += "Delete `"`$COMMONFILES64\CLAP\$n`""
+            $lines += "RMDir /r `"`$COMMONFILES64\CLAP\$n`""
+          }
+          $lines | Set-Content "$stage/uninstall-plugins.nsh"
+          Get-ChildItem -Recurse $stage | Select-Object FullName, Length
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: Build the Setup .exe
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $sha = "${{ github.sha }}".Substring(0,7)
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION="$version-$sha" /DSRC="..\stage" installer\LemonStudio.nsi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem installer\*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LemonStudio-Setup
+          path: installer/LemonStudio-Setup-*.exe
+          retention-days: 30

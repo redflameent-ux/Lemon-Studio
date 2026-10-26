@@ -334,7 +334,14 @@ pub enum Lane {
     ChanPan,
     ChanVolume,
     ChanPitch,
+    /// Per-note expression curves (MPE, Lemon Studio only): drawn over each note's length.
+    MpeBend,
+    MpePressure,
+    MpeSlide,
 }
+
+/// Cents from the MPE bend lane's centre line to its top (and bottom): one octave either way.
+pub const MPE_BEND_VIEW: f32 = 1200.0;
 
 /// Cents spanned by the full height of the channel pitch lane (1.64 cents per pixel over 294 px; §7b).
 const PITCH_SPAN: f32 = 482.0;
@@ -352,7 +359,7 @@ const CTRL_MAX: i32 = 12800;
 
 impl Lane {
     /// Menu order: note properties (the first `NOTE_LANES`), then channel controls.
-    pub const ALL: [Lane; 10] = [
+    pub const ALL: [Lane; 13] = [
         Lane::Pan,
         Lane::Velocity,
         Lane::Release,
@@ -363,8 +370,13 @@ impl Lane {
         Lane::ChanPan,
         Lane::ChanVolume,
         Lane::ChanPitch,
+        Lane::MpeBend,
+        Lane::MpePressure,
+        Lane::MpeSlide,
     ];
     pub const NOTE_LANES: usize = 7;
+    /// Index in `ALL` of the first MPE lane (after the channel controls).
+    pub const MPE_LANES: usize = 10;
     /// Dimmed name over the panel.
     pub fn name(self) -> &'static str {
         match self {
@@ -378,6 +390,9 @@ impl Lane {
             Lane::ChanPan => "Channel panning",
             Lane::ChanVolume => "Channel volume",
             Lane::ChanPitch => "Channel pitch",
+            Lane::MpeBend => "MPE pitch bend (per note)",
+            Lane::MpePressure => "MPE pressure (per note)",
+            Lane::MpeSlide => "MPE slide (per note)",
         }
     }
     /// Entry in the Control menu.
@@ -393,6 +408,40 @@ impl Lane {
             Lane::ChanPan => "Channel panning",
             Lane::ChanVolume => "Channel volume",
             Lane::ChanPitch => "Channel pitch",
+            Lane::MpeBend => "Pitch bend",
+            Lane::MpePressure => "Pressure",
+            Lane::MpeSlide => "Slide (timbre)",
+        }
+    }
+    /// The note expression an MPE lane draws (`None`: another lane).
+    pub fn expr(self) -> Option<os_model::mpe::Expr> {
+        match self {
+            Lane::MpeBend => Some(os_model::mpe::Expr::Bend),
+            Lane::MpePressure => Some(os_model::mpe::Expr::Pressure),
+            Lane::MpeSlide => Some(os_model::mpe::Expr::Slide),
+            _ => None,
+        }
+    }
+    /// Draws per-note expression curves (MPE) instead of one value per note.
+    pub fn is_mpe(self) -> bool {
+        self.expr().is_some()
+    }
+    /// MPE lanes: height of a stored value (bend: cents around the centre line; pressure / slide: 0..=1000).
+    pub fn mpe_y(self, panel: Rect, v: f32) -> f32 {
+        match self {
+            Lane::MpeBend => panel.y + panel.h / 2.0 - v / MPE_BEND_VIEW * panel.h / 2.0,
+            _ => panel.bottom() - v / 1000.0 * panel.h,
+        }
+    }
+    /// MPE lanes: the stored value at height `y`; a bend snaps to whole semitones with `snap`.
+    pub fn mpe_value_at(self, panel: Rect, y: f32, snap: bool) -> i16 {
+        match self {
+            Lane::MpeBend => {
+                let v = (panel.y + panel.h / 2.0 - y) / (panel.h / 2.0) * MPE_BEND_VIEW;
+                let v = if snap { (v / 100.0).round() * 100.0 } else { v };
+                v.round().clamp(-MPE_BEND_VIEW, MPE_BEND_VIEW) as i16
+            }
+            _ => ((panel.bottom() - y) / panel.h * 1000.0).round().clamp(0.0, 1000.0) as i16,
         }
     }
     /// Edits control points of the channel instead of note properties.
@@ -713,6 +762,54 @@ pub fn targets(s: &State) -> Vec<usize> {
     notes(s).iter().enumerate().filter(|(_, n)| Some(n.channel) == ch).map(|(i, _)| i).collect()
 }
 
+/// MPE lanes: paints a stroke from `(ta, va)` to `(tb, vb)` (ticks, stored values) onto the curve of `expr` of the
+/// target notes (the selection, else the channel's notes) that the stroke's time span touches. Returns the tick span of
+/// the notes painted.
+pub fn paint_mpe(s: &mut State, expr: os_model::mpe::Expr, ta: f32, va: i16, tb: f32, vb: i16) -> Option<(u32, u32)> {
+    let ((ta, va), (tb, vb)) = if ta <= tb { ((ta, va), (tb, vb)) } else { ((tb, vb), (ta, va)) };
+    let cand = targets(s);
+    let p = pattern_mut(s);
+    let mut span: Option<(u32, u32)> = None;
+    for (i, n) in p.notes.iter_mut().enumerate() {
+        if !cand.contains(&i) || n.length == 0 {
+            continue;
+        }
+        let (start, end) = (n.position as f32, (n.position + n.length) as f32);
+        if tb < start || ta > end {
+            continue;
+        }
+        // The part of the stroke over this note, as fractions of it, with the stroke's heights there.
+        let len = end - start;
+        let at = |t: f32| if tb > ta { va as f32 + (vb as f32 - va as f32) * ((t - ta) / (tb - ta)) } else { va as f32 };
+        let (a, b) = (ta.max(start), tb.min(end));
+        n.mpe.get_mut(expr).paint((a - start) / len, at(a).round() as i16, (b - start) / len, at(b).round() as i16);
+        span = Some(span.map_or((n.position, n.position + n.length), |(l, r)| (l.min(n.position), r.max(n.position + n.length))));
+    }
+    span
+}
+
+/// MPE lanes: removes the points of `expr` between ticks `ta` and `tb` from the target notes. Returns how many notes
+/// changed.
+pub fn erase_mpe(s: &mut State, expr: os_model::mpe::Expr, ta: f32, tb: f32) -> usize {
+    let (ta, tb) = (ta.min(tb), ta.max(tb));
+    let cand = targets(s);
+    let p = pattern_mut(s);
+    let mut changed = 0;
+    for (i, n) in p.notes.iter_mut().enumerate() {
+        if !cand.contains(&i) || n.length == 0 {
+            continue;
+        }
+        let (start, len) = (n.position as f32, n.length as f32);
+        if tb < start || ta > start + len || n.mpe.get(expr).is_empty() {
+            continue;
+        }
+        let before = *n.mpe.get(expr);
+        n.mpe.get_mut(expr).erase((ta - start) / len, (tb - start) / len);
+        changed += usize::from(before != *n.mpe.get(expr));
+    }
+    changed
+}
+
 /// Move notes by `dt` ticks and `dk` keys; refused (false) when any would leave tick 0 / the key range.
 pub fn shift(s: &mut State, idx: &[usize], dt: i64, dk: i32) -> bool {
     let ok = idx.iter().filter_map(|&i| notes(s).get(i)).all(|n| {
@@ -749,8 +846,11 @@ pub fn slice(s: &mut State, tick: u32) -> usize {
     let p = pattern_mut(s);
     for &i in &cut {
         let n = p.notes[i];
+        // Each half keeps its part of the note's expression curves (MPE).
+        let (left, right) = n.mpe.split((tick - n.position) as f32 / n.length as f32);
         p.notes[i].length = tick - n.position;
-        p.notes.push(Note { position: tick, length: n.position + n.length - tick, ..n });
+        p.notes[i].mpe = left;
+        p.notes.push(Note { position: tick, length: n.position + n.length - tick, mpe: right, ..n });
     }
     s.piano.clear_selection();
     finish_edit(s);

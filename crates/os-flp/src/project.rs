@@ -1360,6 +1360,7 @@ fn decode_note(r: &[u8]) -> Note {
         group: r[19],
         unk14: u16_at(14),
         repeat: r[17],
+        mpe: Default::default(),
     }
 }
 
@@ -2792,7 +2793,7 @@ pub fn apply(project: &Project, file: &mut FlpFile) -> Result<(), ProjectError> 
             sorted.sort_by_key(|n| n.position);
             let mut data = Vec::with_capacity(sorted.len() * NOTE_LEN);
             for n in &sorted {
-                match original.chunks_exact(NOTE_LEN).find(|r| decode_note(r) == *n) {
+                match original.chunks_exact(NOTE_LEN).find(|r| decode_note(r) == Note { mpe: Default::default(), ..*n }) {
                     Some(r) => data.extend_from_slice(r),
                     None => data.extend_from_slice(&encode_note(n)),
                 }

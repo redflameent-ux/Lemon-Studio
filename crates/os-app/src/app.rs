@@ -1536,7 +1536,11 @@ impl App {
             self.tell(crate::dialog::Kind::Info, "Project not supported yet", crate::dialog::spans(&["Lemon Studio cannot open ", &name, &rest]));
         }
         match result {
-            Ok((file, project)) => {
+            Ok((file, mut project)) => {
+                // Per-note expression curves (MPE) live in a companion file beside the project (os_flp::mpe).
+                if let Ok(text) = std::fs::read_to_string(os_flp::mpe::path_for(&path)) {
+                    os_flp::mpe::read(&mut project, &text);
+                }
                 self.transport.stop();
                 self.reset_hosted();
                 let s = &mut self.state;
@@ -1766,6 +1770,16 @@ impl App {
             Err(e) => format!("Save failed: {e}"),
         });
         if s.message.as_deref().is_some_and(|m| m.starts_with("Saved")) {
+            // Per-note expression curves (MPE) go to the companion file; a project without any removes an old one.
+            let companion = os_flp::mpe::path_for(&target);
+            let kept = match os_flp::mpe::write(&proj) {
+                Some(text) => std::fs::write(&companion, text),
+                None if companion.exists() => std::fs::remove_file(&companion),
+                None => Ok(()),
+            };
+            if let Err(e) = kept {
+                s.message = Some(format!("Saved {} (MPE curves not saved: {e})", target.display()));
+            }
             // The saved file now holds the channels and mixer tracks in model order, and the plugins as written.
             settle_origins(&mut s.project);
             crate::project_plugins::adopt_saved(&mut s.project, &proj);
@@ -5957,7 +5971,7 @@ impl App {
             }
             return;
         }
-        if action == Some(Action::PianoVelocity) && self.state.piano.lane.is_channel() {
+        if action == Some(Action::PianoVelocity) && (self.state.piano.lane.is_channel() || self.state.piano.lane.is_mpe()) {
             piano::snapshot(&mut self.state);
             self.drag = Some(Drag::ControlErase { last_x: x });
             self.erase_control_points(x, x);
@@ -6334,6 +6348,15 @@ impl App {
     fn erase_control_points(&mut self, last_x: f32, x: f32) {
         let (Some(g), Some(panel)) = (self.piano_geom(), self.piano_panel) else { return };
         let lane = self.state.piano.lane;
+        // MPE lanes: right-dragging removes the curves' points under the stroke.
+        if let Some(expr) = lane.expr() {
+            if piano::erase_mpe(&mut self.state, expr, g.tick_at(last_x), g.tick_at(x)) > 0 {
+                self.state.piano.dirty = true;
+                self.damage_rect(panel);
+                self.damage_piano();
+            }
+            return;
+        }
         let (Some(ch), Some(param)) = (piano::channel(&self.state), lane.param()) else { return };
         let (a, b) = (last_x.min(x), last_x.max(x));
         let from = crate::piano_snap::cell(&self.state, g.tick_at(a));
@@ -6348,6 +6371,18 @@ impl App {
     fn paint_velocity(&mut self, last_x: f32, last_y: f32, x: f32, y: f32) {
         let (Some(g), Some(panel)) = (self.piano_geom(), self.piano_panel) else { return };
         let lane = self.state.piano.lane;
+        // MPE lanes: the stroke is drawn onto the curves of the notes under it (the selected ones, if any); Ctrl
+        // snaps a bend to whole semitones.
+        if let Some(expr) = lane.expr() {
+            let (va, vb) = (lane.mpe_value_at(panel, last_y, self.ctrl), lane.mpe_value_at(panel, y, self.ctrl));
+            if let Some((l, r)) = piano::paint_mpe(&mut self.state, expr, g.tick_at(last_x), va, g.tick_at(x), vb) {
+                self.state.piano.dirty = true;
+                let (l, r) = (g.x_of(l as f32), g.x_of(r as f32));
+                self.damage_rect(Rect::new(l - 6.0, panel.y, r - l + 12.0, panel.h).intersect(&panel.outset(1.0)));
+                self.damage_piano();
+            }
+            return;
+        }
         if lane.is_channel() {
             let (Some(ch), Some(param)) = (piano::channel(&self.state), lane.param()) else { return };
             let center = self.state.piano.pitch_center;
@@ -15060,6 +15095,98 @@ mod tests {
         let r = hit_rect(&app, &Action::BrowserCollapse);
         click(&mut app, &mut c, r);
         assert!(!app.state.browser_open.iter().any(|k| k.starts_with("2:")), "Collapse closes the tab's nodes");
+    }
+
+    /// The MPE lanes (Lemon Studio): picked from the event panel's Control menu, a left-drag draws a pitch bend over
+    /// the notes under it (the selected ones, if any), Ctrl snaps it to semitones, a right-drag erases, each stroke is
+    /// one undo step, slicing splits the curve, and the curves survive a save and reopen through the companion file
+    /// beside the project.
+    #[test]
+    fn piano_mpe_lanes() {
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.z = vec![Win::PianoRoll];
+        app.state.selected_channel = 0;
+        frame(&mut app, &mut c, None);
+        let ch = piano::channel(&app.state).unwrap();
+        {
+            let p = piano::pattern_mut(&mut app.state);
+            p.notes.retain(|n| n.channel != ch);
+            p.notes.push(Note { length: 192, key: 60, ..Note::step(ch, 0) });
+            p.notes.push(Note { length: 96, key: 64, ..Note::step(ch, 192) });
+        }
+        let bend_lane = piano::Lane::ALL.iter().position(|&l| l == piano::Lane::MpeBend).unwrap();
+        app.act(Action::PianoLanePick(bend_lane));
+        assert_eq!(app.state.piano.lane, piano::Lane::MpeBend);
+        frame(&mut app, &mut c, None);
+        let panel = hit_rect(&app, &Action::PianoVelocity);
+        let x_of = |app: &App, t: f32| app.piano_geom().unwrap().x_of(t);
+        let lane = piano::Lane::MpeBend;
+        let note = |app: &App, i: usize| piano::notes(&app.state).iter().filter(|n| n.channel == ch).nth(i).copied().unwrap();
+        // A rising stroke over the first note, from no bend to an octave up.
+        app.mouse_move(x_of(&app, 0.0), lane.mpe_y(panel, 0.0));
+        app.mouse_down();
+        for k in 1..=10 {
+            let t = 190.0 * k as f32 / 10.0;
+            app.mouse_move(x_of(&app, t), lane.mpe_y(panel, 1200.0 * k as f32 / 10.0));
+        }
+        app.mouse_up();
+        let first = note(&app, 0);
+        assert!((first.mpe.bend.value_at(0.0).unwrap()).abs() < 30.0, "{:?}", first.mpe.bend.value_at(0.0));
+        assert!((first.mpe.bend.value_at(0.98).unwrap() - 1200.0).abs() < 40.0, "{:?}", first.mpe.bend.value_at(0.98));
+        assert!(note(&app, 1).mpe.is_empty(), "the stroke ended before the next note");
+        frame(&mut app, &mut c, None); // draws the curves in the panel and the bend over the note
+        // One undo step takes the stroke back.
+        assert!(piano::undo(&mut app.state));
+        assert!(note(&app, 0).mpe.is_empty());
+        // Ctrl snaps a click to a whole semitone.
+        app.ctrl = true;
+        frame(&mut app, &mut c, None);
+        app.mouse_move(x_of(&app, 96.0), lane.mpe_y(panel, 330.0));
+        app.mouse_down();
+        app.mouse_up();
+        app.ctrl = false;
+        assert_eq!(note(&app, 0).mpe.bend.value_at(0.5), Some(300.0));
+        // A right-drag across it erases the points.
+        frame(&mut app, &mut c, None);
+        app.mouse_move(x_of(&app, 80.0), panel.cy());
+        app.mouse_down_right();
+        app.mouse_move(x_of(&app, 110.0), panel.cy());
+        app.mouse_up();
+        assert!(note(&app, 0).mpe.bend.is_empty());
+        // Pressure, and slicing a note splits its curve between the halves.
+        app.act(Action::PianoLanePick(bend_lane + 1));
+        assert_eq!(app.state.piano.lane, piano::Lane::MpePressure);
+        frame(&mut app, &mut c, None);
+        let pl = piano::Lane::MpePressure;
+        app.mouse_move(x_of(&app, 0.0), pl.mpe_y(panel, 20.0));
+        app.mouse_down();
+        app.mouse_move(x_of(&app, 191.0), pl.mpe_y(panel, 990.0));
+        app.mouse_up();
+        assert_eq!(piano::slice(&mut app.state, 96), 1);
+        let halves: Vec<Note> = piano::notes(&app.state).iter().filter(|n| n.channel == ch && n.key == 60).copied().collect();
+        assert_eq!(halves.len(), 2);
+        assert!(halves[0].mpe.pressure.value_at(1.0).unwrap() > 400.0 && halves[0].mpe.pressure.value_at(1.0).unwrap() < 600.0);
+        assert!(halves[1].mpe.pressure.value_at(1.0).unwrap() > 940.0);
+        // Save and reopen: the curves come back from the companion file; the project itself is FL's format.
+        let path = std::env::temp_dir().join(format!("lemon-mpe-{}.flp", std::process::id()));
+        let companion = os_flp::mpe::path_for(&path);
+        app.save_to(path.clone());
+        assert!(app.state.message.as_deref().is_some_and(|m| m.starts_with("Saved") && !m.contains("MPE")), "{:?}", app.state.message);
+        assert!(companion.exists());
+        let saved: Vec<Note> = piano::notes(&app.state).iter().filter(|n| n.channel == ch).copied().collect();
+        let mut again = App::new(None);
+        again.open(path.clone());
+        let back: Vec<Note> = again.state.project.patterns.iter().find(|p| p.number == app.state.pattern).unwrap().notes.iter().filter(|n| n.channel == ch).copied().collect();
+        assert_eq!(back.iter().map(|n| n.mpe).collect::<Vec<_>>(), saved.iter().map(|n| n.mpe).collect::<Vec<_>>());
+        // Without curves left, saving removes the companion file.
+        for n in &mut piano::pattern_mut(&mut app.state).notes {
+            n.mpe = Default::default();
+        }
+        app.save_to(path.clone());
+        assert!(!companion.exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The piano roll's magnet button (spec: ui/piano-snap.md): its two menus, where clicks, moves, resizes and the

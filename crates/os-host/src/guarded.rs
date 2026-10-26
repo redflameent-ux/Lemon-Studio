@@ -105,6 +105,12 @@ impl<P: Plugin> Instrument for Guarded<P> {
     fn set_bend_range(&mut self, semitones: u32) {
         self.run((), |p| p.set_bend_range(semitones))
     }
+    fn note_pressure(&mut self, offset: u32, key: u8, value: f32) {
+        self.run((), |p| p.note_pressure(offset, key, value))
+    }
+    fn note_brightness(&mut self, offset: u32, key: u8, value: f32) {
+        self.run((), |p| p.note_brightness(offset, key, value))
+    }
     fn process(&mut self, rate: u32, left: &mut [f32], right: &mut [f32]) {
         let t0 = Instant::now();
         let voices = self.run(None, |p| {

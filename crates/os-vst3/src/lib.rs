@@ -28,7 +28,7 @@ use vst3_sys::gui::{IPlugView, IPlugViewContentScaleSupport, ViewRect};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
     AudioBusBuffers, BusInfo, Event, EventData, IAudioProcessor, IComponent, IConnectionPoint, IEditController, IMidiMapping, INoteExpressionController,
-    IUnitInfo, NoteExpressionTypeInfo, NoteExpressionValueEvent, NoteOffEvent, NoteOnEvent, ParameterInfo, ProcessContext, ProcessData, ProcessSetup, UnitInfo,
+    IUnitInfo, NoteExpressionTypeInfo, NoteExpressionValueEvent, NoteOffEvent, NoteOnEvent, PolyPressureEvent, ParameterInfo, ProcessContext, ProcessData, ProcessSetup, UnitInfo,
 };
 use vst3_sys::{c_void, ComInterface, VstPtr, IID};
 
@@ -442,6 +442,10 @@ enum NoteKind {
     Off,
     /// Tuning of the key's sounding note, `velocity` = semitones.
     Tune,
+    /// Polyphonic pressure of the key's sounding note (MPE), `velocity` = 0..=1.
+    Pressure,
+    /// Brightness note expression of the key's sounding note (MPE slide), `velocity` = 0..=1.
+    Bright,
 }
 
 /// A note event waiting for the next `process` call.
@@ -456,8 +460,10 @@ struct Note {
 // Event types and the tuning note expression (spec §5).
 const NOTE_ON_EVENT: u16 = 0;
 const NOTE_OFF_EVENT: u16 = 1;
+const POLY_PRESSURE_EVENT: u16 = 3;
 const NOTE_EXPRESSION_VALUE_EVENT: u16 = 4;
 const TUNING_TYPE_ID: u32 = 2;
+const BRIGHTNESS_TYPE_ID: u32 = 5;
 
 /// A running VST 3 instance.
 pub struct Plugin {
@@ -513,6 +519,8 @@ pub struct Plugin {
     /// Glides as pitch bend (through `midi_map`) for a plug-in whose controller lists no tuning note expression (spec:
     /// audio/channel-voices.md); `None`: glides are tuning expressions. `bend_range` survives a new reading.
     bend: Option<os_engine::TuningBend>,
+    /// The plug-in lists the brightness note expression (MPE slide goes to it; else to controller 74 when mapped).
+    brightness: bool,
     bend_range: u32,
     /// Automation values (frame offset, id, normalized) for the next process call.
     auto: Vec<(u32, u32, f64)>,
@@ -601,6 +609,7 @@ impl Plugin {
                 param_ids: Vec::new(),
                 midi_map: Vec::new(),
                 bend: None,
+                brightness: false,
                 bend_range: os_engine::instrument::DEFAULT_BEND_RANGE,
                 auto: Vec::with_capacity(MAX_AUTO),
                 units: Vec::new(),
@@ -763,12 +772,16 @@ impl Plugin {
         }
         // A plug-in that lists the tuning expression takes glides as one; another glides by pitch bend when it maps
         // pitch bend to a parameter, else not at all.
-        let tuning = c.cast::<dyn INoteExpressionController>().is_some_and(|x| unsafe {
-            (0..x.get_note_expression_count(0, 0)).any(|i| {
-                let mut info: NoteExpressionTypeInfo = std::mem::zeroed();
-                x.get_note_expression_info(0, 0, i, &mut info) == kResultOk && info.type_id == TUNING_TYPE_ID
+        let lists = |type_id: u32| {
+            c.cast::<dyn INoteExpressionController>().is_some_and(|x| unsafe {
+                (0..x.get_note_expression_count(0, 0)).any(|i| {
+                    let mut info: NoteExpressionTypeInfo = std::mem::zeroed();
+                    x.get_note_expression_info(0, 0, i, &mut info) == kResultOk && info.type_id == type_id
+                })
             })
-        });
+        };
+        let tuning = lists(TUNING_TYPE_ID);
+        self.brightness = lists(BRIGHTNESS_TYPE_ID);
         self.bend = (!tuning && self.midi_map.get(129).is_some_and(|&id| id != u32::MAX)).then(|| {
             let mut b = os_engine::TuningBend::default();
             b.set_range(self.bend_range);
@@ -1151,7 +1164,7 @@ impl Plugin {
                     match e.kind {
                         NoteKind::On => self.ledger.start(e.key, -1),
                         NoteKind::Off => self.ledger.release(e.key),
-                        NoteKind::Tune => {}
+                        NoteKind::Tune | NoteKind::Pressure | NoteKind::Bright => {}
                     }
                 }
             } else {
@@ -1283,6 +1296,18 @@ impl NoteIds {
                 // Normalized tuning: 0.5 = none, plain semitones = 240 * (v - 0.5).
                 let value = (f64::from(n.velocity) / 240.0 + 0.5).clamp(0.0, 1.0);
                 (NOTE_EXPRESSION_VALUE_EVENT, EventData { note_expression_value: NoteExpressionValueEvent { type_id: TUNING_TYPE_ID, note_id: id, value } })
+            }
+            NoteKind::Pressure => {
+                let pressure = PolyPressureEvent { channel: 0, pitch: i16::from(n.key), pressure: n.velocity.clamp(0.0, 1.0), note_id: self.ids[key] };
+                (POLY_PRESSURE_EVENT, EventData { poly_pressure: pressure })
+            }
+            NoteKind::Bright => {
+                let id = self.ids[key];
+                if id < 0 {
+                    return None;
+                }
+                let value = f64::from(n.velocity).clamp(0.0, 1.0);
+                (NOTE_EXPRESSION_VALUE_EVENT, EventData { note_expression_value: NoteExpressionValueEvent { type_id: BRIGHTNESS_TYPE_ID, note_id: id, value } })
             }
         };
         Some(Event { bus_index: 0, sample_offset: n.time as i32, ppq_position: 0.0, flags: 0, type_, event })
@@ -1489,6 +1514,20 @@ impl os_engine::Instrument for Plugin {
                 }
             }
             None => self.queue.push(Note { time: offset, kind: NoteKind::Tune, key, velocity: semitones }),
+        }
+    }
+
+    /// MPE pressure: the key's note's polyphonic pressure.
+    fn note_pressure(&mut self, offset: u32, key: u8, value: f32) {
+        self.queue.push(Note { time: offset, kind: NoteKind::Pressure, key, velocity: value });
+    }
+
+    /// MPE slide: the brightness note expression, or controller 74 for a plug-in that maps it to a parameter.
+    fn note_brightness(&mut self, offset: u32, key: u8, value: f32) {
+        if self.brightness {
+            self.queue.push(Note { time: offset, kind: NoteKind::Bright, key, velocity: value });
+        } else if self.midi_map.get(74).is_some_and(|&id| id != u32::MAX) {
+            os_engine::Instrument::midi(self, offset, [0xB0, 74, (value.clamp(0.0, 1.0) * 127.0).round() as u8]);
         }
     }
 

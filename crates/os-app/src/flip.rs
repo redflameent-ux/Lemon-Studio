@@ -33,9 +33,16 @@ pub fn flip(mut notes: Vec<Note>, set: &Settings) -> Vec<Note> {
     for n in &mut notes {
         if set.horizontal {
             n.position = if set.preserve { first + (last_start - n.position) } else { first + (last_end - (n.position + n.length)) };
+            // Mirrored in time, a note's expression curves (MPE) play backwards too.
+            if !set.preserve {
+                n.mpe = n.mpe.reversed();
+            }
         }
         if set.vertical {
             n.key = low + (high - n.key);
+            // Mirrored in pitch, its bend goes the other way.
+            let pts: Vec<(u16, i16)> = n.mpe.bend.points().iter().map(|&(x, y)| (x, -y)).collect();
+            n.mpe.bend = os_model::mpe::Curve::from_points(&pts);
         }
     }
     notes

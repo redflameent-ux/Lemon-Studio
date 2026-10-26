@@ -10,6 +10,7 @@
 
 pub mod crossfade;
 pub mod curve;
+pub mod mpe;
 
 /// An RGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1208,6 +1209,8 @@ pub struct Note {
     pub unk14: u16,
     /// Note repeat index 0..=14 (byte 17; 0 = off; spec: flp/events/patterns.md).
     pub repeat: u8,
+    /// Per-note expression curves (MPE); Lemon Studio only, kept beside the `.flp` (see [`mpe`]).
+    pub mpe: mpe::NoteMpe,
 }
 
 impl Note {
@@ -1293,6 +1296,7 @@ impl Note {
             group: 0,
             unk14: 0,
             repeat: 0,
+            mpe: mpe::NoteMpe::default(),
         }
     }
 }

@@ -247,6 +247,25 @@ pub fn paint(ui: &mut Ui, s: &State, r: Rect, f: &FrameInfo) {
             ui.c.text_clip(label_font, nr.x + if lemon { 4.0 } else { 3.0 }, nr.y + 2.0, room - 4.0, text, &shown);
         }
     }
+    // Per-note pitch bends (MPE): the pitch each note glides along, drawn through its row, over the notes.
+    for n in notes.iter().filter(|n| Some(n.channel) == ch && n.length > 0 && !n.mpe.bend.is_empty()) {
+        let (x0, x1) = (g.x_of(n.position as f32), g.x_of((n.position + n.length) as f32));
+        if x1 < l.grid.x || x0 > l.grid.right() {
+            continue;
+        }
+        let steps = ((x1 - x0) / 3.0).clamp(2.0, 400.0) as usize;
+        let pts: Vec<(f32, f32)> = (0..=steps)
+            .map(|k| {
+                let f = k as f32 / steps as f32;
+                let semis = n.mpe.bend.value_at(f).unwrap_or(0.0) / 100.0;
+                (x0 + (x1 - x0) * f, g.y_of(i32::from(n.key)) + g.row / 2.0 - semis * g.row)
+            })
+            .collect();
+        ui.c.polyline(&pts, 2.0, t.pill.with_alpha(220));
+        if let Some(&(x, y)) = pts.last() {
+            ui.c.fill_circle(x, y, 2.5, t.pill);
+        }
+    }
     // Tool overlays (§9): marquee and zoom box (orange, rounded), slice and scrub lines.
     match s.piano.overlay {
         Some(Overlay::Marquee(m) | Overlay::ZoomBox(m)) => {
@@ -648,13 +667,16 @@ fn velocity_panel(ui: &mut Ui, s: &State, l: &Layout, g: &Geom, notes: &[Note], 
     if lane.is_channel() {
         control_bars(ui, s, g, p, lane, ch);
     }
+    if lane.is_mpe() {
+        mpe_curves(ui, s, g, p, lane, ch, notes, sel);
+    }
     ui.c.pop_clip();
     if lane == Lane::ChanPitch {
         pitch_scroll(ui, s, l);
     }
     ui.c.push_clip(p);
     // Lollipops.
-    for (idx, n) in notes.iter().enumerate().filter(|(_, n)| !lane.is_channel() && Some(n.channel) == ch) {
+    for (idx, n) in notes.iter().enumerate().filter(|(_, n)| !lane.is_channel() && !lane.is_mpe() && Some(n.channel) == ch) {
         let x = g.x_of(n.position as f32).floor();
         if x > p.right() + 4.0 {
             continue;
@@ -734,6 +756,60 @@ fn control_bars(ui: &mut Ui, s: &State, g: &Geom, p: Rect, lane: Lane, ch: Optio
     }
 }
 
+/// MPE lanes (Lemon Studio): each note's curve over its length, the note's span as a band behind it, and a dotted line
+/// at the resting value where a note has no curve. The bend lane has its zero line and a faint line per semitone.
+#[allow(clippy::too_many_arguments)]
+fn mpe_curves(ui: &mut Ui, s: &State, g: &Geom, p: Rect, lane: Lane, ch: Option<u16>, notes: &[os_model::Note], sel: &[usize]) {
+    let Some(expr) = lane.expr() else { return };
+    let t = ui.t;
+    if lane == Lane::MpeBend {
+        let semis = (piano::MPE_BEND_VIEW / 100.0) as i32;
+        let px = p.h / 2.0 / semis as f32;
+        for k in -semis..=semis {
+            let y = lane.mpe_y(p, (k * 100) as f32).round();
+            let strong = k == 0 || k % 12 == 0;
+            if strong || px >= 4.0 {
+                ui.c.fill_rect(Rect::new(p.x, y, p.w, 1.0), t.text_faint.with_alpha(if k == 0 { 110 } else if strong { 70 } else { 28 }));
+            }
+        }
+    }
+    let curve_col = t.pill;
+    for (idx, n) in notes.iter().enumerate().filter(|(_, n)| Some(n.channel) == ch && n.length > 0) {
+        let (x0, x1) = (g.x_of(n.position as f32), g.x_of((n.position + piano::shown_len(s, n)) as f32));
+        if x1 < p.x - 4.0 || x0 > p.right() + 4.0 {
+            continue;
+        }
+        let selected = sel.contains(&idx);
+        let band = if selected { t.note_sel_top.with_alpha(40) } else { t.velocity.with_alpha(22) };
+        ui.c.fill_rect(Rect::new(x0, p.y, (x1 - x0).max(1.0), p.h), band);
+        ui.c.fill_rect(Rect::new(x0.floor(), p.y, 1.0, p.h), t.velocity.with_alpha(90));
+        let c = n.mpe.get(expr);
+        if c.is_empty() {
+            // No curve: a dotted line where the expression rests.
+            let y = lane.mpe_y(p, f32::from(expr.rest())).round();
+            let mut x = x0 + 2.0;
+            while x < x1 - 1.0 {
+                ui.c.fill_rect(Rect::new(x, y, 2.0, 1.0), t.text_faint);
+                x += 5.0;
+            }
+            continue;
+        }
+        let steps = ((x1 - x0) / 3.0).clamp(2.0, 400.0) as usize;
+        let pts: Vec<(f32, f32)> = (0..=steps)
+            .map(|k| {
+                let f = k as f32 / steps as f32;
+                (x0 + (x1 - x0) * f, lane.mpe_y(p, c.value_at(f).unwrap_or(0.0)))
+            })
+            .collect();
+        let col = if selected { t.note_sel_rim } else if n.muted() { ui.t.s(0x80858a) } else { curve_col };
+        ui.c.polyline(&pts, 2.0, col);
+        for &(fx, v) in c.points() {
+            let x = x0 + (x1 - x0) * f32::from(fx) / f32::from(os_model::mpe::Curve::END);
+            ui.c.fill_circle(x, lane.mpe_y(p, f32::from(v)), 2.5, col);
+        }
+    }
+}
+
 /// The event panel's Control menu (spec: ui/piano-roll.md §7a): same look as the menu bar dropdowns. `k`: the canvas is
 /// at the Pop-ups scaling, a window position `x` is `x / k` (see `Ui::scaled`).
 fn lane_menu(ui: &mut Ui, s: &State, l: &Layout, k: f32) {
@@ -741,7 +817,8 @@ fn lane_menu(ui: &mut Ui, s: &State, l: &Layout, k: f32) {
     const ROW: f32 = 19.0;
     const HEAD: f32 = 16.0;
     let (w0, w1) = (170.0, 124.0);
-    let h = HEAD + 7.0 * ROW;
+    // Seven note properties on the left; three channel controls, then the MPE heading and three lanes on the right.
+    let h = (HEAD + 7.0 * ROW).max(HEAD + 6.0 * ROW + HEAD + 2.0);
     let win_h = ui.c.size().1;
     let r = Rect::new((l.label.x + 9.0) / k, ((l.label.y + 24.0) / k).min(win_h - h - 8.0), w0 + w1 + 6.0, h + 4.0);
     ui.c.fill_rect(r, t.menu_pop);
@@ -755,13 +832,19 @@ fn lane_menu(ui: &mut Ui, s: &State, l: &Layout, k: f32) {
     };
     head(ui, body.x, w0, "Note properties");
     head(ui, body.x + w0 + 2.0, w1, "Channel controls");
+    // Per-note MPE curves (Lemon Studio) below the channel controls, under their own heading.
+    let mpe_head = body.y + HEAD + 3.0 * ROW;
+    ui.c.fill_rect(Rect::new(body.x + w0 + 2.0, mpe_head + 2.0, w1, HEAD), t.menu_pop_head);
+    ui.c.text(Font::new(12), body.x + w0 + 6.0, mpe_head + 3.0, t.menu_pop_head_text, "MPE (per note)");
     ui.c.fill_rect(Rect::new(body.x + w0, body.y, 2.0, body.h), t.menu_pop_border);
     for (i, lane) in Lane::ALL.iter().enumerate() {
         // Note properties fill the left column, channel controls the right one.
         let rr = if i < Lane::NOTE_LANES {
             Rect::new(body.x, body.y + HEAD + i as f32 * ROW, w0, ROW)
-        } else {
+        } else if i < Lane::MPE_LANES {
             Rect::new(body.x + w0 + 2.0, body.y + HEAD + (i - Lane::NOTE_LANES) as f32 * ROW, w1, ROW)
+        } else {
+            Rect::new(body.x + w0 + 2.0, mpe_head + HEAD + 2.0 + (i - Lane::MPE_LANES) as f32 * ROW, w1, ROW)
         };
         if ui.hit(rr, Action::PianoLanePick(i), lane.menu_name()) || *lane == s.piano.lane {
             ui.c.fill_rect(rr, t.menu_pop_hi);

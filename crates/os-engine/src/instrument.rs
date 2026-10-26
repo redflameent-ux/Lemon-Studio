@@ -136,6 +136,16 @@ pub trait Instrument: Send {
     fn midi(&mut self, offset: u32, bytes: [u8; 3]) {
         let _ = (offset, bytes);
     }
+    /// Per-note expression (MPE): the pressure (0..=1) of the note on `key`, `offset` frames into the next `process`
+    /// call. Its pitch bend comes as the key's tuning (`tune`). Default: ignored.
+    fn note_pressure(&mut self, offset: u32, key: u8, value: f32) {
+        let _ = (offset, key, value);
+    }
+    /// Per-note expression (MPE): the slide (timbre / brightness, MPE's CC 74; 0..=1) of the note on `key`, `offset`
+    /// frames into the next `process` call. Default: ignored.
+    fn note_brightness(&mut self, offset: u32, key: u8, value: f32) {
+        let _ = (offset, key, value);
+    }
     /// The delay the instrument puts its output out late by, in samples, as it reports it (a hosted plugin's latency).
     /// The engine reads it right after `process` and delays the channel's other paths to match (spec:
     /// audio/delay-compensation.md). Default: none.

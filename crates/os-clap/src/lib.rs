@@ -21,7 +21,7 @@ use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{
     clap_event_header, clap_event_midi, clap_event_note, clap_event_note_expression, clap_event_param_gesture, clap_event_param_mod, clap_event_param_value,
     clap_event_transport, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_CHOKE, CLAP_EVENT_NOTE_EXPRESSION,
-    CLAP_EVENT_MIDI, CLAP_EVENT_NOTE_END, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_NOTE_EXPRESSION_PAN, CLAP_NOTE_EXPRESSION_TUNING, CLAP_NOTE_EXPRESSION_VOLUME, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END,
+    CLAP_EVENT_MIDI, CLAP_EVENT_NOTE_END, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_NOTE_EXPRESSION_BRIGHTNESS, CLAP_NOTE_EXPRESSION_PAN, CLAP_NOTE_EXPRESSION_PRESSURE, CLAP_NOTE_EXPRESSION_TUNING, CLAP_NOTE_EXPRESSION_VOLUME, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END,
     CLAP_EVENT_PARAM_MOD, CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT, CLAP_TRANSPORT_HAS_BEATS_TIMELINE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE,
     CLAP_TRANSPORT_HAS_TEMPO, CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
 };
@@ -504,6 +504,10 @@ enum Kind {
     Tune,
     /// A named voice's gain (note expression); `velocity` holds the gain.
     Gain,
+    /// Pressure of a key's voices (MPE note expression, 0..=1); `velocity` holds it.
+    Pressure,
+    /// Brightness / slide of a key's voices (MPE note expression, 0..=1); `velocity` holds it.
+    Bright,
 }
 
 /// One entry of a chunk's event order: an index into `notes`, `mods` or `exprs`.
@@ -1378,7 +1382,25 @@ impl Plugin {
             seq.push(Seq::Mod(self.mods.len() - 1));
         }
         for e in self.queue.drain(..) {
-            if e.time < n && e.kind == Kind::Tune {
+            if e.time < n && matches!(e.kind, Kind::Pressure | Kind::Bright) {
+                // Per-note expression (MPE): pressure / brightness of the key's voices, 0..=1.
+                self.exprs.push(clap_event_note_expression {
+                    header: clap_event_header {
+                        size: std::mem::size_of::<clap_event_note_expression>() as u32,
+                        time: e.time,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        type_: CLAP_EVENT_NOTE_EXPRESSION,
+                        flags: 0,
+                    },
+                    expression_id: if e.kind == Kind::Pressure { CLAP_NOTE_EXPRESSION_PRESSURE } else { CLAP_NOTE_EXPRESSION_BRIGHTNESS },
+                    note_id: -1,
+                    port_index: 0,
+                    channel: 0,
+                    key: i16::from(e.key),
+                    value: f64::from(e.velocity).clamp(0.0, 1.0),
+                });
+                seq.push(Seq::Expr(self.exprs.len() - 1));
+            } else if e.time < n && e.kind == Kind::Tune {
                 // Portamento glides (spec: audio/channel-voices.md): CLAP tuning expression, semitones.
                 self.exprs.push(clap_event_note_expression {
                     header: clap_event_header {
@@ -1439,7 +1461,7 @@ impl Plugin {
                     Kind::On => self.ledger.start(e.key, id),
                     Kind::Off => self.ledger.release(e.key),
                     Kind::Choke if id >= 0 => self.ledger.choke_voice(id),
-                    Kind::Choke | Kind::Tune | Kind::Gain => self.ledger.choke(e.key),
+                    Kind::Choke | Kind::Tune | Kind::Gain | Kind::Pressure | Kind::Bright => self.ledger.choke(e.key),
                 }
                 self.notes.push(clap_event_note {
                     header: clap_event_header {
@@ -1449,7 +1471,7 @@ impl Plugin {
                         type_: match e.kind {
                             Kind::On => CLAP_EVENT_NOTE_ON,
                             Kind::Off => CLAP_EVENT_NOTE_OFF,
-                            Kind::Choke | Kind::Tune | Kind::Gain => CLAP_EVENT_NOTE_CHOKE,
+                            Kind::Choke | Kind::Tune | Kind::Gain | Kind::Pressure | Kind::Bright => CLAP_EVENT_NOTE_CHOKE,
                         },
                         flags: 0,
                     },
@@ -1898,6 +1920,23 @@ impl os_engine::Instrument for Plugin {
     fn set_bend_range(&mut self, semitones: u32) {
         if let Some(b) = &mut self.bend {
             b.set_range(semitones);
+        }
+    }
+
+    /// MPE pressure: a CLAP note expression; a plugin that takes MIDI notes gets polyphonic key pressure.
+    fn note_pressure(&mut self, offset: u32, key: u8, value: f32) {
+        match self.bend {
+            // A frame late: controller messages go before the block's notes, and this one is for a note started now.
+            Some(_) => self.midi_queue.push((offset.max(1), [0xA0, key & 127, (value.clamp(0.0, 1.0) * 127.0).round() as u8])),
+            None => self.queue.push(Ev::new(offset, Kind::Pressure, key, value)),
+        }
+    }
+
+    /// MPE slide: a CLAP brightness note expression; a plugin that takes MIDI notes gets controller 74.
+    fn note_brightness(&mut self, offset: u32, key: u8, value: f32) {
+        match self.bend {
+            Some(_) => self.midi_queue.push((offset.max(1), [0xB0, 74, (value.clamp(0.0, 1.0) * 127.0).round() as u8])),
+            None => self.queue.push(Ev::new(offset, Kind::Bright, key, value)),
         }
     }
 

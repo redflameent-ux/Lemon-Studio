@@ -18,6 +18,7 @@ mod check;
 mod container;
 mod error;
 mod event;
+pub mod mpe;
 pub mod project;
 pub mod wrapper;
 

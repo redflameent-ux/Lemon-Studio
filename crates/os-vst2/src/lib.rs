@@ -1091,6 +1091,16 @@ impl os_engine::Instrument for Plugin {
         self.bend.set_range(semitones);
     }
 
+    /// MPE pressure: polyphonic key pressure (a frame late, after the note it is for).
+    fn note_pressure(&mut self, offset: u32, key: u8, value: f32) {
+        os_engine::Instrument::midi(self, offset.max(1), [0xA0, key & 127, (value.clamp(0.0, 1.0) * 127.0).round() as u8]);
+    }
+
+    /// MPE slide: controller 74 (a frame late, after the note it is for).
+    fn note_brightness(&mut self, offset: u32, _key: u8, value: f32) {
+        os_engine::Instrument::midi(self, offset.max(1), [0xB0, 74, (value.clamp(0.0, 1.0) * 127.0).round() as u8]);
+    }
+
     fn param(&mut self, offset: u32, index: u32, value: f64) {
         self.automate(offset, index, value);
     }

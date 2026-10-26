@@ -105,6 +105,8 @@ struct Trigger {
     /// The group it cuts and the group its voice belongs to as the note carries them from a layer (`None`: the
     /// channel's own).
     cuts: Option<(u32, u32)>,
+    /// The note's per-note expression curves (MPE): an index into `Engine::mpes`, 0 = none.
+    mpe: u32,
 }
 
 /// The layer a voice's note came through, and the child's crossfade gain (1 without the crossfade) (spec:
@@ -180,13 +182,15 @@ struct InstTuning {
     moves: bool,
     fine: [f32; 128],
     glide: [f32; 128],
+    /// Per key, the note's own MPE pitch bend (semitones) as its curve stands (`InstMpe`).
+    bend: [f32; 128],
     sent: [u8; 128],
     keys: u128,
 }
 
 impl Default for InstTuning {
     fn default() -> Self {
-        InstTuning { shift: 0.0, moves: false, fine: [0.0; 128], glide: [0.0; 128], sent: std::array::from_fn(|k| k as u8), keys: 0 }
+        InstTuning { shift: 0.0, moves: false, fine: [0.0; 128], glide: [0.0; 128], bend: [0.0; 128], sent: std::array::from_fn(|k| k as u8), keys: 0 }
     }
 }
 
@@ -199,7 +203,7 @@ impl InstTuning {
     /// The tuning (semitones) of `key`'s latest note: the shift, its fine pitch and glide, less what its key moved.
     fn tuning(&self, key: u8) -> f32 {
         let k = usize::from(key & 127);
-        self.shift + self.fine[k] + self.glide[k] - (f32::from(self.sent[k]) - f32::from(key))
+        self.shift + self.fine[k] + self.glide[k] + self.bend[k] - (f32::from(self.sent[k]) - f32::from(key))
     }
 }
 
@@ -212,6 +216,19 @@ struct InstClip {
     shape: ClipShape,
     age: u64,
     sent: Option<f32>,
+}
+
+/// A note with per-note expression curves (MPE) playing on an instrument channel: its key, frames since it started,
+/// its length in frames and the values last sent (bend, pressure, slide). Every `VOICE_GAIN_FRAMES` frames the curves'
+/// values reach the instrument: the bend as the key's tuning, pressure and slide as note expressions.
+#[derive(Debug, Clone, Copy)]
+struct InstMpe {
+    channel: usize,
+    key: u8,
+    age: u64,
+    total: u64,
+    curves: os_model::mpe::NoteMpe,
+    sent: [Option<f32>; 3],
 }
 
 /// An audio clip's fades (milliseconds, tension) and gain: the fades it plays (with automatic crossfades on, an edge
@@ -1031,6 +1048,10 @@ pub struct Engine {
     inst_offs: Vec<(u64, usize, u8, Option<u32>)>,
     /// Audio clips with fades or gain playing on instrument channels.
     inst_shapes: Vec<InstClip>,
+    /// Notes with expression curves (MPE) playing on instrument channels.
+    inst_mpe: Vec<InstMpe>,
+    /// The song's notes' expression curves (`Trigger::mpe`); entry 0 is none.
+    mpes: Vec<os_model::mpe::NoteMpe>,
     /// The name the next audio clip voice on an instrument gets (`Instrument::voice_start`).
     next_voice: u32,
     inst_live: Vec<(usize, u8, f32)>,
@@ -1347,6 +1368,7 @@ impl Engine {
         controls.sort_by_key(|c| c.tick); // stable: equal ticks keep their order
         let (mut sched, end_tick) = schedule(project, mode, &mut report);
         sched.sort_by_key(|s| s.tick);
+        let mut mpes = vec![os_model::mpe::NoteMpe::default()];
         let mut triggers: Vec<Trigger> = sched
             .into_iter()
             .filter_map(|n: Sched| {
@@ -1400,6 +1422,12 @@ impl Engine {
                     porta: n.porta,
                     via: None,
                     cuts: None,
+                    mpe: if n.mpe.is_empty() || n.len == 0 {
+                        0
+                    } else {
+                        mpes.push(n.mpe);
+                        (mpes.len() - 1) as u32
+                    },
                 })
             })
             .collect();
@@ -1552,6 +1580,8 @@ impl Engine {
             out_len: 1,
             inst_offs: Vec::with_capacity(64),
             inst_shapes: Vec::new(),
+            inst_mpe: Vec::new(),
+            mpes,
             next_voice: 0,
             inst_live: Vec::with_capacity(64),
             inst_midi: Vec::with_capacity(64),
@@ -1877,6 +1907,7 @@ impl Engine {
         self.send_held_offs();
         self.relaunch_clips |= self.inst_offs.iter().any(|o| o.3.is_some());
         self.inst_offs.clear();
+        self.inst_mpe.clear();
         let channels = &self.channels;
         self.sounding.retain(|&(c, _, _)| channels.get(c).is_none_or(|ch| ch.instrument.0.is_none()));
         for v in &mut self.note_voices {
@@ -2257,6 +2288,8 @@ impl Engine {
         self.inst_offs.retain(|o| o.1 < n);
         self.inst_shapes = std::mem::take(&mut old.inst_shapes);
         self.inst_shapes.retain(|s| s.channel < n);
+        self.inst_mpe = std::mem::take(&mut old.inst_mpe);
+        self.inst_mpe.retain(|m| m.channel < n);
         // The voices playing on keep their names: new ones get others.
         self.next_voice = old.next_voice;
         // An instance that plays on still owes what it missed; a new one starts afresh.
@@ -2963,6 +2996,13 @@ impl Engine {
                 if let (Some(shape), Some(voice)) = (t.shape, voice) {
                     self.inst_shapes.push(InstClip { channel: t.channel, voice, shape, age: 0, sent: None });
                 }
+                // Its expression curves (MPE) run over its length; a note on the same key ends the earlier one's.
+                if let (Some(curves), Some(end)) = (self.mpes.get(t.mpe as usize).filter(|_| t.mpe > 0).copied(), t.end) {
+                    let at = |tick: u64| Clock::frame_of_tick(self.rate, self.ppq, self.tick_tempo(), tick);
+                    let total = at(end).saturating_sub(at(t.tick)).max(1);
+                    self.inst_mpe.retain(|m| !(m.channel == t.channel && m.key == k));
+                    self.inst_mpe.push(InstMpe { channel: t.channel, key: k, age: 0, total, curves, sent: [None; 3] });
+                }
                 // An audio clip ends at its cut (spec: plugins/lemon-sampler.md Â§7); notes end with a note off.
                 match t.cut {
                     Some(c) => self.inst_offs.push((c, t.channel, k, voice)),
@@ -3151,6 +3191,37 @@ impl Engine {
             for &(_, off, note) in notes {
                 send_note(&mut *inst, off.min(n.saturating_sub(1) as u32), note, fines);
             }
+            // Per-note expression curves (MPE): each note's values every `VOICE_GAIN_FRAMES` frames; a value that
+            // stays is not sent again.
+            {
+                let step = crate::instrument::VOICE_GAIN_FRAMES;
+                for m in self.inst_mpe.iter_mut().filter(|m| m.channel == c) {
+                    for off in (0..n as u32).step_by(step as usize) {
+                        let at = m.age + u64::from(off);
+                        if at >= m.total {
+                            break;
+                        }
+                        let frac = at as f32 / m.total as f32;
+                        for (i, e) in os_model::mpe::Expr::ALL.into_iter().enumerate() {
+                            let Some(v) = m.curves.get(e).value_at(frac) else { continue };
+                            let v = e.to_plugin(v);
+                            if m.sent[i].is_some_and(|s| (s - v).abs() < 1e-4) {
+                                continue;
+                            }
+                            m.sent[i] = Some(v);
+                            let sent = fines.sent(m.key);
+                            match e {
+                                os_model::mpe::Expr::Bend => {
+                                    fines.bend[usize::from(m.key)] = v;
+                                    inst.tune(off, sent, fines.tuning(m.key));
+                                }
+                                os_model::mpe::Expr::Pressure => inst.note_pressure(off, sent, v),
+                                os_model::mpe::Expr::Slide => inst.note_brightness(off, sent, v),
+                            }
+                        }
+                    }
+                }
+            }
             // Audio clip fades and gain on this channel (spec: audio/audio-clips.md "Fades and clip gain"): on each
             // clip's voice when the instrument takes voice gains, so clips that overlap (a crossfade) each have their
             // own. A voice gets its gain now at its start, then every `VOICE_GAIN_FRAMES` frames the gain due that many
@@ -3227,6 +3298,10 @@ impl Engine {
             s.age += n as u64;
         }
         self.inst_shapes.retain(|s| s.shape.since + s.age < s.shape.total.saturating_add(tail));
+        for m in &mut self.inst_mpe {
+            m.age += n as u64;
+        }
+        self.inst_mpe.retain(|m| m.age < m.total);
         self.inst_active = active;
         if active {
             self.inst_tail = u64::from(self.rate) * INSTRUMENT_TAIL_SECONDS;
@@ -3830,6 +3905,7 @@ fn send_note(inst: &mut dyn Instrument, off: u32, note: notes::Note, fines: &mut
             }
             let k = key & 127;
             (fines.fine[usize::from(k)], fines.glide[usize::from(k)], fines.sent[usize::from(k)]) = (fine, 0.0, sent);
+            fines.bend[usize::from(k)] = 0.0;
             fines.keys |= 1 << k;
             let tuning = fines.tuning(key);
             if tuning.abs() > 1e-3 {
@@ -3911,6 +3987,8 @@ struct Sched {
     slide: bool,
     /// The note's own portamento switch.
     porta: bool,
+    /// The note's expression curves (MPE).
+    mpe: os_model::mpe::NoteMpe,
 }
 
 impl Sched {
@@ -3930,6 +4008,7 @@ impl Sched {
             clip: None,
             slide: n.slide(),
             porta: n.porta(),
+            mpe: n.mpe,
         }
     }
 }
@@ -4169,7 +4248,7 @@ fn schedule(project: &Project, mode: PlayMode, report: &mut EngineReport) -> (Ve
                         // An audio clip plays its channel's sample from the window start (milliseconds), cut at the clip end.
                         Some(ChannelKind::AudioClip | ChannelKind::Sampler) => {
                             let from_s = c.window.map_or(0.0, |w| w.0.max(0.0) / 1000.0);
-                            out.push(Sched { tick: start, channel: usize::from(ch), key: 60, fine: 120, velocity: 100, pan: 64, mod_x: 128, mod_y: 128, cut: Some(start + len), len, from_s, clip: ClipFx::of(c, fx), slide: false, porta: false });
+                            out.push(Sched { tick: start, channel: usize::from(ch), key: 60, fine: 120, velocity: 100, pan: 64, mod_x: 128, mod_y: 128, cut: Some(start + len), len, from_s, clip: ClipFx::of(c, fx), slide: false, porta: false, mpe: Default::default() });
                         }
                         Some(ChannelKind::Automation) => {}
                         _ => report.automation_clips_ignored += 1,
@@ -5333,6 +5412,72 @@ mod tests {
         assert_eq!(centred, crate::NoteLevels::default());
         assert_eq!(got, vec![(60, half), (62, centred)]);
         assert_eq!(crate::NoteLevels::of_bytes(0, 0, 255), crate::NoteLevels { pan: -1.0, mod_x: -1.0, mod_y: 127.0 / 128.0 });
+    }
+
+    /// A note's MPE curves reach a hosted instrument while it plays: the bend as the key's tuning, gliding along the
+    /// curve; pressure and slide as note expressions, each sent again only when it changes; nothing after the note's
+    /// end, and the next note on the key starts unbent.
+    #[test]
+    fn hosted_notes_play_their_mpe_curves() {
+        use os_model::mpe::Curve;
+        use os_model::{Clip, ClipSource};
+        #[derive(Default)]
+        struct Log {
+            at: u64,
+            tunes: Vec<(u64, u8, f32)>,
+            pressure: Vec<(u64, u8, f32)>,
+            bright: Vec<(u64, u8, f32)>,
+            ons: Vec<u64>,
+        }
+        impl crate::Instrument for Log {
+            fn note_on(&mut self, o: u32, _k: u8, _v: f32) {
+                self.ons.push(self.at + u64::from(o));
+            }
+            fn note_off(&mut self, _o: u32, _k: u8) {}
+            fn tune(&mut self, o: u32, key: u8, semitones: f32) {
+                self.tunes.push((self.at + u64::from(o), key, semitones));
+            }
+            fn takes_tuning(&self) -> bool {
+                true
+            }
+            fn note_pressure(&mut self, o: u32, key: u8, v: f32) {
+                self.pressure.push((self.at + u64::from(o), key, v));
+            }
+            fn note_brightness(&mut self, o: u32, key: u8, v: f32) {
+                self.bright.push((self.at + u64::from(o), key, v));
+            }
+            fn process(&mut self, _rate: u32, l: &mut [f32], _r: &mut [f32]) {
+                self.at += l.len() as u64;
+            }
+        }
+        let mut bent = long_note(0, 48, 0);
+        bent.mpe.bend = Curve::from_points(&[(0, 0), (Curve::END, 200)]);
+        bent.mpe.pressure = Curve::from_points(&[(0, 1000)]);
+        bent.mpe.slide = Curve::from_points(&[(0, 0), (Curve::END / 2, 1000)]);
+        let after = long_note(48, 48, 0);
+        let p = song(vec![bent, after], vec![Clip::new(0, 96, 0, ClipSource::Pattern(1))]);
+        let mut e = Engine::new(&p, &mut SampleLibrary::new(None), 48000, PlayMode::Song);
+        let log = Arc::new(std::sync::Mutex::new(Log::default()));
+        e.set_instrument(0, log.clone());
+        e.render_all(480);
+        let l = log.lock().unwrap();
+        assert_eq!(l.ons.len(), 2);
+        let end = l.ons[1];
+        // The bend glides from none to two semitones over the note, and stops at its end.
+        let bends: Vec<_> = l.tunes.iter().filter(|t| t.0 < end).collect();
+        assert!(bends.len() > 20, "{} bend steps", bends.len());
+        assert!(bends[0].2.abs() < 0.01);
+        assert!(bends.windows(2).all(|w| w[1].2 >= w[0].2 && w[1].0 >= w[0].0));
+        assert!((bends.last().unwrap().2 - 2.0).abs() < 0.05, "{:?}", bends.last());
+        // The next note on the key gets no bend of its own.
+        assert!(l.tunes.iter().filter(|t| t.0 >= end).all(|t| t.2.abs() < 1e-3));
+        // A pressure that stays is sent once.
+        assert_eq!(l.pressure.len(), 1);
+        assert_eq!((l.pressure[0].1, l.pressure[0].2), (60, 1.0));
+        // The slide rises over the first half, then holds.
+        assert!(l.bright.iter().all(|b| b.0 < end));
+        assert!((l.bright.last().unwrap().2 - 1.0).abs() < 1e-3);
+        assert!(l.bright.last().unwrap().0 < end / 2 + 200);
     }
 
     /// Records what a layer's child is given, by frame: note ons (velocity), offs, chokes and tunings (semitones); it
